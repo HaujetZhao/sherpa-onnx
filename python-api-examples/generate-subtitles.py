@@ -76,9 +76,11 @@ import argparse
 import shutil
 import subprocess
 import sys
+import json
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from copy import copy
 
 import numpy as np
 import sherpa_onnx
@@ -362,8 +364,9 @@ def main():
 
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = args.silero_vad_model
-    config.silero_vad.min_silence_duration = 0.25
+    config.silero_vad.min_silence_duration = 0.20
     config.sample_rate = args.sample_rate
+    
 
     window_size = config.silero_vad.window_size
 
@@ -371,6 +374,8 @@ def main():
     vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=100)
 
     segment_list = []
+    tokens = []
+    timestamps = []
 
     print("Started!")
 
@@ -406,16 +411,59 @@ def main():
             vad.pop()
 
         recognizer.decode_streams(streams)
+
         for seg, stream in zip(segments, streams):
-            seg.text = stream.result.text
-            segment_list.append(seg)
+
+            # 汇总 tokens 和 timestamps
+            tokens += stream.result.tokens
+            timestamps += [round(timestamp + seg.start, 3) for timestamp in stream.result.timestamps]
+
+            # 如果有 token 时间戳，那就进行二次分段
+            if stream.result.timestamps:
+                pre_token_time = 0
+                pre_sentence_end = 0
+                sentence = ''
+                subseg = copy(seg)
+                for (time, token) in zip(stream.result.timestamps, stream.result.tokens):
+                    if time - pre_token_time < 0.5:
+                        sentence += token
+                    else:
+                        # 将句子加入列表
+                        subseg.duration = time - pre_sentence_end
+                        subseg.text = sentence
+                        segment_list.append(subseg)
+
+                        # 更新 subseg
+                        pre_sentence_end = time
+                        sentence = token
+                        subseg = copy(seg)
+                        subseg.start = subseg.start + time 
+
+                    pre_token_time = time
+
+                subseg.duration = time + 0.2 - pre_sentence_end
+                subseg.text = sentence
+                segment_list.append(subseg)
+            
+            # 没有 token 时间戳，就直接加入列表
+            else:
+                seg.text = stream.result.text
+                segment_list.append(seg)
 
     srt_filename = Path(args.sound_file).with_suffix(".srt")
+    txt_filename = Path(args.sound_file).with_suffix(".txt")
+    json_filename = Path(args.sound_file).with_suffix(".json")
+
     with open(srt_filename, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segment_list):
             print(i + 1, file=f)
             print(seg, file=f)
             print("", file=f)
+    with open(txt_filename, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segment_list):
+            print(seg.text, file=f)
+    with open(json_filename, "w", encoding="utf-8") as f:
+        json.dump({'timestamps': timestamps, 'tokens': tokens}, f, ensure_ascii=False)
 
     print(f"Saved to {srt_filename}")
     print("Done!")
